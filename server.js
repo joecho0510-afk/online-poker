@@ -10,6 +10,9 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS = 2;
+const STARTING_CHIPS = 1000;
+const ANTE = 50;
+const CALL_BET = 50;
 
 const SUITS = [
   { symbol: "♠", name: "spades", color: "black" },
@@ -66,7 +69,7 @@ function createDeck() {
 }
 
 function shuffle(array) {
-  for (let i = array.length - 1; i > 0; i--) {
+  for (let i = array.length - 1; i > 0; i -= 1) {
     const j = Math.floor(Math.random() * (i + 1));
     [array[i], array[j]] = [array[j], array[i]];
   }
@@ -83,7 +86,7 @@ function createRoom(code) {
     log: "상대를 기다리는 중입니다.",
     winnerIds: [],
     revealResults: null,
-    turnIndex: 0
+    pot: 0
   };
 }
 
@@ -92,15 +95,20 @@ function createPlayer(id, name) {
     id,
     name,
     hand: [],
-    stood: false,
-    actionDone: false
+    folded: false,
+    actionDone: false,
+    chips: STARTING_CHIPS,
+    currentBet: 0,
+    totalCommitted: 0
   };
 }
 
 function resetPlayerRoundState(player) {
   player.hand = [];
-  player.stood = false;
+  player.folded = false;
   player.actionDone = false;
+  player.currentBet = 0;
+  player.totalCommitted = 0;
 }
 
 function getRoomBySocketId(socketId) {
@@ -110,6 +118,34 @@ function getRoomBySocketId(socketId) {
     }
   }
   return null;
+}
+
+function activePlayers(room) {
+  return room.players.filter((player) => !player.folded);
+}
+
+function takeBet(player, amount) {
+  const actual = Math.max(0, Math.min(amount, player.chips));
+  player.chips -= actual;
+  player.currentBet += actual;
+  player.totalCommitted += actual;
+  return actual;
+}
+
+function awardPot(room, winnerIds) {
+  if (!winnerIds.length || room.pot <= 0) return;
+
+  const baseShare = Math.floor(room.pot / winnerIds.length);
+  let remainder = room.pot % winnerIds.length;
+
+  for (const winnerId of winnerIds) {
+    const winner = room.players.find((player) => player.id === winnerId);
+    if (!winner) continue;
+    winner.chips += baseShare + (remainder > 0 ? 1 : 0);
+    if (remainder > 0) remainder -= 1;
+  }
+
+  room.pot = 0;
 }
 
 function dealCard(room, player, isFaceDown) {
@@ -131,17 +167,20 @@ function visibleCardsForEvaluation(player) {
 
 function combinations(arr, k) {
   const result = [];
+
   function helper(start, path) {
     if (path.length === k) {
       result.push([...path]);
       return;
     }
-    for (let i = start; i < arr.length; i++) {
+
+    for (let i = start; i < arr.length; i += 1) {
       path.push(arr[i]);
       helper(i + 1, path);
       path.pop();
     }
   }
+
   helper(0, []);
   return result;
 }
@@ -156,7 +195,7 @@ function countByRank(values) {
 
 function compareArraysDesc(a, b) {
   const maxLength = Math.max(a.length, b.length);
-  for (let i = 0; i < maxLength; i++) {
+  for (let i = 0; i < maxLength; i += 1) {
     const av = a[i] || 0;
     const bv = b[i] || 0;
     if (av > bv) return 1;
@@ -172,8 +211,11 @@ function evaluateFiveCardHand(hand) {
 
   const uniqueAsc = [...new Set(hand.map((card) => card.rankValue))].sort((a, b) => a - b);
   let straightHigh = null;
+
   if (uniqueAsc.length === 5) {
-    const isNormalStraight = uniqueAsc.every((value, index) => index === 0 || value === uniqueAsc[index - 1] + 1);
+    const isNormalStraight = uniqueAsc.every(
+      (value, index) => index === 0 || value === uniqueAsc[index - 1] + 1
+    );
     const isWheel = JSON.stringify(uniqueAsc) === JSON.stringify([2, 3, 4, 5, 14]);
     if (isNormalStraight) straightHigh = uniqueAsc[4];
     if (isWheel) straightHigh = 5;
@@ -208,17 +250,26 @@ function evaluateFiveCardHand(hand) {
     tiebreak = [straightHigh];
   } else if (groups[0].count === 3) {
     rank = 3;
-    const kickers = groups.filter((group) => group.count === 1).map((group) => group.value).sort((a, b) => b - a);
+    const kickers = groups
+      .filter((group) => group.count === 1)
+      .map((group) => group.value)
+      .sort((a, b) => b - a);
     tiebreak = [groups[0].value, ...kickers];
   } else if (groups[0].count === 2 && groups[1].count === 2) {
     rank = 2;
-    const pairValues = groups.filter((group) => group.count === 2).map((group) => group.value).sort((a, b) => b - a);
+    const pairValues = groups
+      .filter((group) => group.count === 2)
+      .map((group) => group.value)
+      .sort((a, b) => b - a);
     const kicker = groups.find((group) => group.count === 1).value;
     tiebreak = [...pairValues, kicker];
   } else if (groups[0].count === 2) {
     rank = 1;
     const pairValue = groups[0].value;
-    const kickers = groups.filter((group) => group.count === 1).map((group) => group.value).sort((a, b) => b - a);
+    const kickers = groups
+      .filter((group) => group.count === 1)
+      .map((group) => group.value)
+      .sort((a, b) => b - a);
     tiebreak = [pairValue, ...kickers];
   } else {
     rank = 0;
@@ -238,6 +289,7 @@ function evaluateBestSevenCardHand(cards) {
 
   for (const combo of combos) {
     const evaluated = evaluateFiveCardHand(combo);
+
     if (!best) {
       best = { ...evaluated, bestCards: combo };
       continue;
@@ -270,7 +322,7 @@ function compareHands(cardsA, cardsB) {
 }
 
 function everyoneDoneForStage(room) {
-  return room.players.every((player) => player.actionDone || player.stood);
+  return room.players.every((player) => player.actionDone || player.folded);
 }
 
 function dealStageCard(room) {
@@ -278,37 +330,38 @@ function dealStageCard(room) {
 
   for (const player of room.players) {
     player.actionDone = false;
+    player.currentBet = 0;
   }
 
   if (room.stage === 1) {
-    for (const player of room.players) {
+    for (const player of activePlayers(room)) {
       dealCard(room, player, false);
     }
-    room.log = "4th Street: 공개 카드 1장씩 추가되었습니다. 콜을 누르세요.";
+    room.log = `4th Street: 공개 카드 1장씩 추가되었습니다. 콜(${CALL_BET}) 또는 폴드를 선택하세요.`;
     return;
   }
 
   if (room.stage === 2) {
-    for (const player of room.players) {
+    for (const player of activePlayers(room)) {
       dealCard(room, player, false);
     }
-    room.log = "5th Street: 공개 카드 1장씩 추가되었습니다. 콜을 누르세요.";
+    room.log = `5th Street: 공개 카드 1장씩 추가되었습니다. 콜(${CALL_BET}) 또는 폴드를 선택하세요.`;
     return;
   }
 
   if (room.stage === 3) {
-    for (const player of room.players) {
+    for (const player of activePlayers(room)) {
       dealCard(room, player, false);
     }
-    room.log = "6th Street: 공개 카드 1장씩 추가되었습니다. 콜을 누르세요.";
+    room.log = `6th Street: 공개 카드 1장씩 추가되었습니다. 콜(${CALL_BET}) 또는 폴드를 선택하세요.`;
     return;
   }
 
   if (room.stage === 4) {
-    for (const player of room.players) {
+    for (const player of activePlayers(room)) {
       dealCard(room, player, true);
     }
-    room.log = "7th Street: 마지막 뒷면 카드가 지급되었습니다. 콜을 누르면 쇼다운합니다.";
+    room.log = `7th Street: 마지막 뒷면 카드가 지급되었습니다. 콜(${CALL_BET}) 또는 폴드를 선택하세요.`;
     return;
   }
 
@@ -322,10 +375,21 @@ function startRound(room) {
   room.stage = 0;
   room.winnerIds = [];
   room.revealResults = null;
-  room.turnIndex = 0;
+  room.pot = 0;
 
   for (const player of room.players) {
     resetPlayerRoundState(player);
+  }
+
+  const eligiblePlayers = room.players.filter((player) => player.chips >= ANTE + CALL_BET);
+  if (eligiblePlayers.length < 2) {
+    room.phase = "waiting";
+    room.log = "두 플레이어 모두 충분한 칩이 있어야 게임을 시작할 수 있습니다.";
+    return;
+  }
+
+  for (const player of room.players) {
+    room.pot += takeBet(player, ANTE);
   }
 
   for (const player of room.players) {
@@ -334,19 +398,20 @@ function startRound(room) {
     dealCard(room, player, false);
   }
 
-  room.log = "세븐 포커 시작: 2장 뒷면, 1장 앞면 카드가 지급되었습니다. 콜 또는 폴드를 선택하세요.";
+  room.log = `세븐 포커 시작: 기본 판돈 ${ANTE}씩 들어가 총 판돈은 ${room.pot}입니다. 콜(${CALL_BET}) 또는 폴드를 선택하세요.`;
 }
 
 function finishRound(room) {
   room.phase = "reveal";
 
-  const activePlayers = room.players.filter((player) => !player.stood);
-  if (activePlayers.length === 1) {
-    room.winnerIds = [activePlayers[0].id];
+  const alivePlayers = activePlayers(room);
+  if (alivePlayers.length === 1) {
+    room.winnerIds = [alivePlayers[0].id];
     room.revealResults = {
-      [activePlayers[0].id]: evaluateBestSevenCardHand(visibleCardsForEvaluation(activePlayers[0]))
+      [alivePlayers[0].id]: evaluateBestSevenCardHand(visibleCardsForEvaluation(alivePlayers[0]))
     };
-    room.log = `${activePlayers[0].name} 승리! 상대가 폴드했습니다.`;
+    room.log = `${alivePlayers[0].name} 승리! 상대가 폴드했습니다.`;
+    awardPot(room, room.winnerIds);
     return;
   }
 
@@ -367,6 +432,8 @@ function finishRound(room) {
     room.winnerIds = [p1.id, p2.id];
     room.log = `무승부! 둘 다 ${room.revealResults[p1.id].handName}`;
   }
+
+  awardPot(room, room.winnerIds);
 }
 
 function publicRoomState(room, viewerId) {
@@ -375,14 +442,20 @@ function publicRoomState(room, viewerId) {
     phase: room.phase,
     stage: room.stage,
     log: room.log,
+    pot: room.pot || 0,
+    ante: ANTE,
+    callBet: CALL_BET,
     canStart: room.players.length === MAX_PLAYERS && room.phase !== "playing",
     winnerIds: room.winnerIds,
     players: room.players.map((player) => ({
       id: player.id,
       name: player.name,
       isMe: player.id === viewerId,
-      folded: player.stood,
+      folded: player.folded,
       actionDone: player.actionDone,
+      chips: player.chips,
+      currentBet: player.currentBet,
+      totalCommitted: player.totalCommitted,
       hand: player.hand.map((card) => {
         const shouldHide = room.phase !== "reveal" && player.id !== viewerId && card.isFaceDown;
         return shouldHide ? { hidden: true } : card;
@@ -460,14 +533,22 @@ io.on("connection", (socket) => {
     if (!room || room.phase !== "playing") return;
 
     const player = room.players.find((item) => item.id === socket.id);
-    if (!player || player.stood) return;
+    if (!player || player.folded) return;
+
     if (player.actionDone) {
       socket.emit("error_message", "이미 이번 단계 선택을 마쳤습니다.");
       return;
     }
 
+    if (player.chips < CALL_BET) {
+      socket.emit("error_message", `콜에 필요한 칩이 부족합니다. 필요 칩: ${CALL_BET}`);
+      return;
+    }
+
+    const paid = takeBet(player, CALL_BET);
+    room.pot += paid;
     player.actionDone = true;
-    room.log = `${player.name}님이 콜했습니다.`;
+    room.log = `${player.name}님이 콜했습니다. ${paid}칩을 넣어 현재 판돈은 ${room.pot}입니다.`;
 
     if (everyoneDoneForStage(room)) {
       dealStageCard(room);
@@ -481,14 +562,14 @@ io.on("connection", (socket) => {
     if (!room || room.phase !== "playing") return;
 
     const player = room.players.find((item) => item.id === socket.id);
-    if (!player || player.stood) return;
+    if (!player || player.folded) return;
 
-    player.stood = true;
+    player.folded = true;
     player.actionDone = true;
     room.log = `${player.name}님이 폴드했습니다.`;
 
-    const activePlayers = room.players.filter((item) => !item.stood);
-    if (activePlayers.length <= 1) {
+    const alivePlayers = room.players.filter((item) => !item.folded);
+    if (alivePlayers.length <= 1) {
       finishRound(room);
     }
 
@@ -514,6 +595,7 @@ io.on("connection", (socket) => {
     room.stage = 0;
     room.winnerIds = [];
     room.revealResults = null;
+    room.pot = 0;
     room.log = "상대가 나갔습니다. 새 플레이어를 기다립니다.";
 
     for (const player of room.players) {
@@ -634,7 +716,7 @@ app.get("/", (req, res) => {
 <body>
   <div class="wrap">
     <h1>2인 세븐 포커</h1>
-    <p>처음에 2장 뒷면, 1장 앞면 카드가 지급되고 이후 한 장씩 추가됩니다. 간단 버전이라 베팅 없이 콜과 폴드만 있습니다.</p>
+    <p>기본 칩은 1000, 시작할 때 기본 판돈은 50씩 들어갑니다. 각 단계에서 콜 비용은 50이며, 칩은 다음 게임에도 이어집니다.</p>
 
     <div class="panel">
       <div class="row">
@@ -648,6 +730,7 @@ app.get("/", (req, res) => {
 
     <div class="panel">
       <div id="status" class="status">연결 대기 중</div>
+      <div id="potInfo" class="status" style="font-size:16px; color:#bfdbfe;">판돈: 0 / 기본 판돈: 50 / 콜: 50</div>
       <div id="log">방에 입장해 주세요.</div>
       <div id="notice" class="notice"></div>
     </div>
@@ -673,6 +756,7 @@ app.get("/", (req, res) => {
     const callBtn = document.getElementById("callBtn");
     const foldBtn = document.getElementById("foldBtn");
     const statusEl = document.getElementById("status");
+    const potInfoEl = document.getElementById("potInfo");
     const logEl = document.getElementById("log");
     const noticeEl = document.getElementById("notice");
     const playersEl = document.getElementById("players");
@@ -712,6 +796,7 @@ app.get("/", (req, res) => {
       const canAct = myActionAvailable();
 
       statusEl.textContent = '방 코드: ' + state.code + ' / 상태: ' + state.phase + ' / 단계: ' + state.stage;
+      potInfoEl.textContent = '판돈: ' + state.pot + ' / 기본 판돈: ' + state.ante + ' / 콜: ' + state.callBet;
       logEl.textContent = state.log;
       noticeEl.textContent = '';
       startBtn.disabled = !(amHost && state.canStart);
@@ -725,7 +810,7 @@ app.get("/", (req, res) => {
 
         return '<div class="player ' + (player.isMe ? 'me' : '') + '">' +
           '<div class="name">' + escapeHtml(player.name) + (player.isMe ? ' (나)' : '') + '</div>' +
-          '<div class="meta">' + stateText + '</div>' +
+          '<div class="meta">' + stateText + ' / 보유 칩: ' + player.chips + ' / 이번 판 베팅: ' + player.totalCommitted + '</div>' +
           '<div class="cards">' + cardsHtml + '</div>' +
           resultHtml +
         '</div>';
