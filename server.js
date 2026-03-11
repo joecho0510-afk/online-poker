@@ -78,11 +78,29 @@ function createRoom(code) {
     hostId: null,
     players: [],
     deck: [],
-    phase: "waiting", // waiting | exchange | reveal
+    phase: "waiting", // waiting | playing | reveal
+    stage: 0,
     log: "상대를 기다리는 중입니다.",
     winnerIds: [],
-    revealResults: null
+    revealResults: null,
+    turnIndex: 0
   };
+}
+
+function createPlayer(id, name) {
+  return {
+    id,
+    name,
+    hand: [],
+    stood: false,
+    actionDone: false
+  };
+}
+
+function resetPlayerRoundState(player) {
+  player.hand = [];
+  player.stood = false;
+  player.actionDone = false;
 }
 
 function getRoomBySocketId(socketId) {
@@ -94,18 +112,38 @@ function getRoomBySocketId(socketId) {
   return null;
 }
 
-function dealCard(room, player) {
+function dealCard(room, player, isFaceDown) {
   const card = room.deck.pop();
   if (!card) return null;
-  player.hand.push(card);
+  player.hand.push({ ...card, isFaceDown });
   return card;
 }
 
-function resetPlayerRoundState(player) {
-  player.hand = [];
-  player.ready = false;
-  player.exchangeDone = false;
-  player.selectedIndexes = [];
+function visibleCardsForEvaluation(player) {
+  return player.hand.map((card) => ({
+    rankValue: card.rankValue,
+    rankLabel: card.rankLabel,
+    suitName: card.suitName,
+    suitSymbol: card.suitSymbol,
+    color: card.color
+  }));
+}
+
+function combinations(arr, k) {
+  const result = [];
+  function helper(start, path) {
+    if (path.length === k) {
+      result.push([...path]);
+      return;
+    }
+    for (let i = start; i < arr.length; i++) {
+      path.push(arr[i]);
+      helper(i + 1, path);
+      path.pop();
+    }
+  }
+  helper(0, []);
+  return result;
 }
 
 function countByRank(values) {
@@ -127,7 +165,7 @@ function compareArraysDesc(a, b) {
   return 0;
 }
 
-function evaluateHand(hand) {
+function evaluateFiveCardHand(hand) {
   const values = hand.map((card) => card.rankValue).sort((a, b) => b - a);
   const suits = hand.map((card) => card.suitName);
   const isFlush = suits.every((suit) => suit === suits[0]);
@@ -194,9 +232,33 @@ function evaluateHand(hand) {
   };
 }
 
-function compareHands(handA, handB) {
-  const a = evaluateHand(handA);
-  const b = evaluateHand(handB);
+function evaluateBestSevenCardHand(cards) {
+  const combos = combinations(cards, 5);
+  let best = null;
+
+  for (const combo of combos) {
+    const evaluated = evaluateFiveCardHand(combo);
+    if (!best) {
+      best = { ...evaluated, bestCards: combo };
+      continue;
+    }
+
+    if (evaluated.rank > best.rank) {
+      best = { ...evaluated, bestCards: combo };
+      continue;
+    }
+
+    if (evaluated.rank === best.rank && compareArraysDesc(evaluated.tiebreak, best.tiebreak) > 0) {
+      best = { ...evaluated, bestCards: combo };
+    }
+  }
+
+  return best;
+}
+
+function compareHands(cardsA, cardsB) {
+  const a = evaluateBestSevenCardHand(cardsA);
+  const b = evaluateBestSevenCardHand(cardsB);
 
   if (a.rank > b.rank) return { winner: 1, a, b };
   if (a.rank < b.rank) return { winner: -1, a, b };
@@ -207,39 +269,92 @@ function compareHands(handA, handB) {
   return { winner: 0, a, b };
 }
 
-function allPlayersExchanged(room) {
-  return room.players.length === MAX_PLAYERS && room.players.every((player) => player.exchangeDone);
+function everyoneDoneForStage(room) {
+  return room.players.every((player) => player.actionDone || player.stood);
+}
+
+function dealStageCard(room) {
+  room.stage += 1;
+
+  for (const player of room.players) {
+    player.actionDone = false;
+  }
+
+  if (room.stage === 1) {
+    for (const player of room.players) {
+      dealCard(room, player, false);
+    }
+    room.log = "4th Street: 공개 카드 1장씩 추가되었습니다. 콜을 누르세요.";
+    return;
+  }
+
+  if (room.stage === 2) {
+    for (const player of room.players) {
+      dealCard(room, player, false);
+    }
+    room.log = "5th Street: 공개 카드 1장씩 추가되었습니다. 콜을 누르세요.";
+    return;
+  }
+
+  if (room.stage === 3) {
+    for (const player of room.players) {
+      dealCard(room, player, false);
+    }
+    room.log = "6th Street: 공개 카드 1장씩 추가되었습니다. 콜을 누르세요.";
+    return;
+  }
+
+  if (room.stage === 4) {
+    for (const player of room.players) {
+      dealCard(room, player, true);
+    }
+    room.log = "7th Street: 마지막 뒷면 카드가 지급되었습니다. 콜을 누르면 쇼다운합니다.";
+    return;
+  }
+
+  finishRound(room);
 }
 
 function startRound(room) {
   room.deck = createDeck();
   shuffle(room.deck);
-  room.phase = "exchange";
+  room.phase = "playing";
+  room.stage = 0;
   room.winnerIds = [];
   room.revealResults = null;
+  room.turnIndex = 0;
 
   for (const player of room.players) {
     resetPlayerRoundState(player);
   }
 
-  for (let i = 0; i < 5; i++) {
-    for (const player of room.players) {
-      dealCard(room, player);
-    }
+  for (const player of room.players) {
+    dealCard(room, player, true);
+    dealCard(room, player, true);
+    dealCard(room, player, false);
   }
 
-  room.log = "카드를 받았습니다. 최대 3장까지 선택해서 교체한 뒤 공개하세요.";
+  room.log = "세븐 포커 시작: 2장 뒷면, 1장 앞면 카드가 지급되었습니다. 콜 또는 폴드를 선택하세요.";
 }
 
 function finishRound(room) {
   room.phase = "reveal";
 
-  const [p1, p2] = room.players;
-  const comparison = compareHands(p1.hand, p2.hand);
+  const activePlayers = room.players.filter((player) => !player.stood);
+  if (activePlayers.length === 1) {
+    room.winnerIds = [activePlayers[0].id];
+    room.revealResults = {
+      [activePlayers[0].id]: evaluateBestSevenCardHand(visibleCardsForEvaluation(activePlayers[0]))
+    };
+    room.log = `${activePlayers[0].name} 승리! 상대가 폴드했습니다.`;
+    return;
+  }
 
+  const [p1, p2] = room.players;
+  const comparison = compareHands(visibleCardsForEvaluation(p1), visibleCardsForEvaluation(p2));
   room.revealResults = {
-    [p1.id]: evaluateHand(p1.hand),
-    [p2.id]: evaluateHand(p2.hand)
+    [p1.id]: evaluateBestSevenCardHand(visibleCardsForEvaluation(p1)),
+    [p2.id]: evaluateBestSevenCardHand(visibleCardsForEvaluation(p2))
   };
 
   if (comparison.winner === 1) {
@@ -258,19 +373,22 @@ function publicRoomState(room, viewerId) {
   return {
     code: room.code,
     phase: room.phase,
+    stage: room.stage,
     log: room.log,
-    canStart: room.players.length === MAX_PLAYERS && room.phase !== "exchange",
+    canStart: room.players.length === MAX_PLAYERS && room.phase !== "playing",
     winnerIds: room.winnerIds,
     players: room.players.map((player) => ({
       id: player.id,
       name: player.name,
       isMe: player.id === viewerId,
-      exchangeDone: player.exchangeDone,
-      hand: room.phase === "reveal" || player.id === viewerId
-        ? player.hand
-        : player.hand.map(() => ({ hidden: true })),
+      folded: player.stood,
+      actionDone: player.actionDone,
+      hand: player.hand.map((card) => {
+        const shouldHide = room.phase !== "reveal" && player.id !== viewerId && card.isFaceDown;
+        return shouldHide ? { hidden: true } : card;
+      }),
       result: room.phase === "reveal" && room.revealResults
-        ? room.revealResults[player.id]
+        ? room.revealResults[player.id] || null
         : null
     }))
   };
@@ -308,14 +426,7 @@ io.on("connection", (socket) => {
     }
 
     if (!room.players.some((player) => player.id === socket.id)) {
-      room.players.push({
-        id: socket.id,
-        name: trimmedName,
-        hand: [],
-        ready: false,
-        exchangeDone: false,
-        selectedIndexes: []
-      });
+      room.players.push(createPlayer(socket.id, trimmedName));
     }
 
     socket.join(trimmedCode);
@@ -344,57 +455,40 @@ io.on("connection", (socket) => {
     emitRoomState(room);
   });
 
-  socket.on("exchange_cards", ({ indexes }) => {
+  socket.on("call", () => {
     const room = getRoomBySocketId(socket.id);
-    if (!room || room.phase !== "exchange") return;
+    if (!room || room.phase !== "playing") return;
 
     const player = room.players.find((item) => item.id === socket.id);
-    if (!player) return;
-    if (player.exchangeDone) {
-      socket.emit("error_message", "이미 카드 교체를 마쳤습니다.");
+    if (!player || player.stood) return;
+    if (player.actionDone) {
+      socket.emit("error_message", "이미 이번 단계 선택을 마쳤습니다.");
       return;
     }
 
-    const uniqueIndexes = [...new Set((indexes || []).filter((index) => Number.isInteger(index) && index >= 0 && index < 5))].sort((a, b) => b - a);
+    player.actionDone = true;
+    room.log = `${player.name}님이 콜했습니다.`;
 
-    if (uniqueIndexes.length > 3) {
-      socket.emit("error_message", "카드는 최대 3장까지 교체할 수 있습니다.");
-      return;
-    }
-
-    for (const index of uniqueIndexes) {
-      player.hand.splice(index, 1);
-    }
-
-    while (player.hand.length < 5) {
-      dealCard(room, player);
-    }
-
-    player.exchangeDone = true;
-    room.log = `${player.name}님이 카드 교체를 완료했습니다.`;
-
-    if (allPlayersExchanged(room)) {
-      finishRound(room);
+    if (everyoneDoneForStage(room)) {
+      dealStageCard(room);
     }
 
     emitRoomState(room);
   });
 
-  socket.on("stand_pat", () => {
+  socket.on("fold", () => {
     const room = getRoomBySocketId(socket.id);
-    if (!room || room.phase !== "exchange") return;
+    if (!room || room.phase !== "playing") return;
 
     const player = room.players.find((item) => item.id === socket.id);
-    if (!player) return;
-    if (player.exchangeDone) {
-      socket.emit("error_message", "이미 선택을 마쳤습니다.");
-      return;
-    }
+    if (!player || player.stood) return;
 
-    player.exchangeDone = true;
-    room.log = `${player.name}님이 패를 유지했습니다.`;
+    player.stood = true;
+    player.actionDone = true;
+    room.log = `${player.name}님이 폴드했습니다.`;
 
-    if (allPlayersExchanged(room)) {
+    const activePlayers = room.players.filter((item) => !item.stood);
+    if (activePlayers.length <= 1) {
       finishRound(room);
     }
 
@@ -417,6 +511,7 @@ io.on("connection", (socket) => {
     }
 
     room.phase = "waiting";
+    room.stage = 0;
     room.winnerIds = [];
     room.revealResults = null;
     room.log = "상대가 나갔습니다. 새 플레이어를 기다립니다.";
@@ -439,7 +534,7 @@ app.get("/", (req, res) => {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>멀티 포커</title>
+  <title>2인 세븐 포커</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -479,7 +574,7 @@ app.get("/", (req, res) => {
     button.primary { background: #facc15; color: #111827; }
     button.secondary { background: #e2e8f0; color: #111827; }
     button.action { background: #60a5fa; color: white; }
-    button.good { background: #34d399; color: #052e16; }
+    button.danger { background: #f87171; color: #3f0d12; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     .status { font-size: 18px; font-weight: bold; color: #fde68a; margin-bottom: 8px; }
     .notice { min-height: 28px; color: #fecaca; font-weight: bold; }
@@ -510,18 +605,13 @@ app.get("/", (req, res) => {
       justify-content: space-between;
       box-shadow: 0 8px 20px rgba(0,0,0,0.22);
       position: relative;
-      cursor: pointer;
-      user-select: none;
-      transition: transform 0.15s ease, outline 0.15s ease;
     }
-    .card.selected { transform: translateY(-8px); outline: 3px solid #facc15; }
     .card.hidden {
       background: linear-gradient(135deg, #1d4ed8, #1e3a8a);
       color: white;
       align-items: center;
       justify-content: center;
       font-size: 36px;
-      cursor: default;
     }
     .top, .bottom { font-weight: bold; line-height: 1; }
     .bottom { transform: rotate(180deg); text-align: right; }
@@ -543,8 +633,8 @@ app.get("/", (req, res) => {
 </head>
 <body>
   <div class="wrap">
-    <h1>2인 멀티 포커</h1>
-    <p>같은 방 코드로 접속해서 플레이하는 간단한 5카드 드로우 포커입니다. 각자 최대 3장까지 한 번 교체한 뒤 승부합니다.</p>
+    <h1>2인 세븐 포커</h1>
+    <p>처음에 2장 뒷면, 1장 앞면 카드가 지급되고 이후 한 장씩 추가됩니다. 간단 버전이라 베팅 없이 콜과 폴드만 있습니다.</p>
 
     <div class="panel">
       <div class="row">
@@ -564,10 +654,10 @@ app.get("/", (req, res) => {
 
     <div class="panel">
       <div class="row">
-        <button id="exchangeBtn" class="action" disabled>선택 카드 교체</button>
-        <button id="standBtn" class="good" disabled>패 유지</button>
+        <button id="callBtn" class="action" disabled>콜</button>
+        <button id="foldBtn" class="danger" disabled>폴드</button>
       </div>
-      <div class="help" style="margin-top:12px;">내 카드만 클릭해서 선택할 수 있습니다. 최대 3장까지 교체됩니다.</div>
+      <div class="help" style="margin-top:12px;">둘 다 콜하면 다음 카드가 지급됩니다. 마지막까지 가면 자동 쇼다운합니다.</div>
     </div>
 
     <div id="players" class="players"></div>
@@ -580,15 +670,14 @@ app.get("/", (req, res) => {
     const roomInput = document.getElementById("roomInput");
     const joinBtn = document.getElementById("joinBtn");
     const startBtn = document.getElementById("startBtn");
-    const exchangeBtn = document.getElementById("exchangeBtn");
-    const standBtn = document.getElementById("standBtn");
+    const callBtn = document.getElementById("callBtn");
+    const foldBtn = document.getElementById("foldBtn");
     const statusEl = document.getElementById("status");
     const logEl = document.getElementById("log");
     const noticeEl = document.getElementById("notice");
     const playersEl = document.getElementById("players");
 
     let latestState = null;
-    let selectedIndexes = [];
 
     function escapeHtml(value) {
       return String(value)
@@ -599,19 +688,18 @@ app.get("/", (req, res) => {
         .replaceAll("'", "&#39;");
     }
 
-    function isMyTurnToAct() {
-      if (!latestState) return false;
+    function myActionAvailable() {
+      if (!latestState || latestState.phase !== "playing") return false;
       const me = latestState.players.find((player) => player.isMe);
-      return Boolean(me && latestState.phase === "exchange" && !me.exchangeDone);
+      return Boolean(me && !me.folded && !me.actionDone);
     }
 
     function hiddenCardHtml() {
       return '<div class="card hidden">🂠</div>';
     }
 
-    function visibleCardHtml(card, index, selectable) {
-      const selectedClass = selectedIndexes.includes(index) ? 'selected' : '';
-      return '<div class="card ' + selectedClass + '" data-index="' + index + '" ' + (selectable ? '' : 'style="cursor:default;"') + '>' +
+    function visibleCardHtml(card) {
+      return '<div class="card">' +
         '<div class="top ' + card.color + '">' + escapeHtml(card.rankLabel) + '<br>' + escapeHtml(card.suitSymbol) + '</div>' +
         '<div class="center ' + card.color + '">' + escapeHtml(card.suitSymbol) + '</div>' +
         '<div class="bottom ' + card.color + '">' + escapeHtml(card.rankLabel) + '<br>' + escapeHtml(card.suitSymbol) + '</div>' +
@@ -620,59 +708,28 @@ app.get("/", (req, res) => {
 
     function renderState(state) {
       latestState = state;
-      const me = state.players.find((player) => player.isMe);
       const amHost = Boolean(state.players[0] && state.players[0].isMe);
-      const canAct = isMyTurnToAct();
+      const canAct = myActionAvailable();
 
-      statusEl.textContent = '방 코드: ' + state.code + ' / 상태: ' + state.phase;
+      statusEl.textContent = '방 코드: ' + state.code + ' / 상태: ' + state.phase + ' / 단계: ' + state.stage;
       logEl.textContent = state.log;
       noticeEl.textContent = '';
       startBtn.disabled = !(amHost && state.canStart);
-      exchangeBtn.disabled = !canAct;
-      standBtn.disabled = !canAct;
-
-      if (!canAct) {
-        selectedIndexes = [];
-      }
+      callBtn.disabled = !canAct;
+      foldBtn.disabled = !canAct;
 
       playersEl.innerHTML = state.players.map((player) => {
-        const canSelect = player.isMe && state.phase === 'exchange' && !player.exchangeDone;
-        const cardsHtml = player.hand.map((card, index) => {
-          if (card.hidden) return hiddenCardHtml();
-          return visibleCardHtml(card, index, canSelect);
-        }).join('');
-
-        const resultHtml = player.result
-          ? '<div class="result">' + escapeHtml(player.result.handName) + '</div>'
-          : '';
+        const cardsHtml = player.hand.map((card) => card.hidden ? hiddenCardHtml() : visibleCardHtml(card)).join('');
+        const resultHtml = player.result ? '<div class="result">' + escapeHtml(player.result.handName) + '</div>' : '';
+        const stateText = player.folded ? '폴드' : player.actionDone ? '선택 완료' : '진행 중';
 
         return '<div class="player ' + (player.isMe ? 'me' : '') + '">' +
           '<div class="name">' + escapeHtml(player.name) + (player.isMe ? ' (나)' : '') + '</div>' +
-          '<div class="meta">' + (player.exchangeDone ? '선택 완료' : '진행 중') + '</div>' +
+          '<div class="meta">' + stateText + '</div>' +
           '<div class="cards">' + cardsHtml + '</div>' +
           resultHtml +
         '</div>';
       }).join('');
-
-      document.querySelectorAll('.player.me .card[data-index]').forEach((cardEl) => {
-        cardEl.addEventListener('click', () => {
-          if (!isMyTurnToAct()) return;
-          const index = Number(cardEl.dataset.index);
-          const alreadySelected = selectedIndexes.includes(index);
-
-          if (alreadySelected) {
-            selectedIndexes = selectedIndexes.filter((item) => item !== index);
-          } else {
-            if (selectedIndexes.length >= 3) {
-              noticeEl.textContent = '최대 3장까지 선택할 수 있습니다.';
-              return;
-            }
-            selectedIndexes.push(index);
-          }
-
-          renderState(latestState);
-        });
-      });
     }
 
     joinBtn.addEventListener('click', () => {
@@ -682,20 +739,9 @@ app.get("/", (req, res) => {
       });
     });
 
-    startBtn.addEventListener('click', () => {
-      selectedIndexes = [];
-      socket.emit('start_game');
-    });
-
-    exchangeBtn.addEventListener('click', () => {
-      socket.emit('exchange_cards', { indexes: selectedIndexes });
-      selectedIndexes = [];
-    });
-
-    standBtn.addEventListener('click', () => {
-      selectedIndexes = [];
-      socket.emit('stand_pat');
-    });
+    startBtn.addEventListener('click', () => socket.emit('start_game'));
+    callBtn.addEventListener('click', () => socket.emit('call'));
+    foldBtn.addEventListener('click', () => socket.emit('fold'));
 
     socket.on('room_state', renderState);
     socket.on('error_message', (message) => {
